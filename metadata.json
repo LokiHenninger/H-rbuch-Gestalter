@@ -1,0 +1,5 @@
+{
+  "name": "Loki´s Hörbuch-Gestalter",
+  "description": "Eine Webanwendung, um Texte aus Büchern in Hörbücher umzuwandeln, indem Textabschnitten verschiedene KI-generierte Sprecher zugewiesen werden.",
+  "requestFramePermissions": []
+}
