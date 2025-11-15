@@ -1,24 +1,33 @@
 
 import React, { useRef, useLayoutEffect, useCallback } from 'react';
-import type { Assignment, Selection } from '../types';
+import type { Assignment, Selection, AtmosphereSuggestion } from '../types';
 import { hexToRgba } from '../utils';
 
 interface HighlightingTextareaProps {
   text: string;
   assignments: Assignment[];
+  atmosphereSuggestions: AtmosphereSuggestion[];
   onTextChange: (text: string) => void;
   onSelect: (selection: Selection | null) => void;
   speakerColors: { [key: string]: string };
-  id: string; // Add id to the props
+  id: string;
+}
+
+interface Segment {
+  start: number;
+  end: number;
+  assignment?: Assignment;
+  atmosphere?: AtmosphereSuggestion;
 }
 
 export const HighlightingTextarea: React.FC<HighlightingTextareaProps> = ({
   text,
   assignments,
+  atmosphereSuggestions,
   onTextChange,
   onSelect,
   speakerColors,
-  id, // Destructure id from props
+  id,
 }) => {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const highlightsRef = useRef<HTMLDivElement>(null);
@@ -32,38 +41,54 @@ export const HighlightingTextarea: React.FC<HighlightingTextareaProps> = ({
 
   useLayoutEffect(() => {
     handleScroll();
-  }, [text, assignments, handleScroll]);
+  }, [text, assignments, atmosphereSuggestions, handleScroll]);
 
   const renderHighlights = () => {
-    const sortedAssignments = [...assignments].sort((a, b) => a.start - b.start);
-    const parts = [];
-    let lastIndex = 0;
-
-    sortedAssignments.forEach((assignment) => {
-      // Add text before the current assignment (if any)
-      if (assignment.start > lastIndex) {
-        parts.push(<span key={`text-${lastIndex}`}>{text.substring(lastIndex, assignment.start)}</span>);
-      }
-      // Add the highlighted text
-      const hexColor = speakerColors[assignment.speakerId] || '#FFFFFF';
-      const color = hexToRgba(hexColor, 0.3);
-
-      parts.push(
-        <span key={`assignment-${assignment.id}`} style={{ backgroundColor: color }} className="rounded-sm">
-          {text.substring(assignment.start, assignment.end)}
-        </span>
-      );
-      lastIndex = assignment.end;
+    // Create a set of all "change points" in the text
+    const points = new Set([0, text.length]);
+    [...assignments, ...atmosphereSuggestions].forEach(item => {
+      points.add(item.start);
+      points.add(item.end);
     });
 
-    // Add any remaining text after the last assignment
-    if (lastIndex < text.length) {
-      parts.push(<span key={`text-${lastIndex}`}>{text.substring(lastIndex)}</span>);
-    }
-     // Add a trailing newline to ensure the last line height is matched
-    parts.push(<br key="final-break" />);
+    // Sort the points to create segments
+    const sortedPoints = Array.from(points).sort((a, b) => a - b);
+    
+    const segments = [];
+    for (let i = 0; i < sortedPoints.length - 1; i++) {
+        const start = sortedPoints[i];
+        const end = sortedPoints[i + 1];
 
-    return parts;
+        if (start >= end) continue; // Skip zero-length segments
+
+        const midPoint = start + (end - start) / 2;
+
+        // Find which assignment and atmosphere apply to this segment
+        const assignment = assignments.find(a => midPoint >= a.start && midPoint < a.end);
+        const atmosphere = atmosphereSuggestions.find(s => midPoint >= s.start && midPoint < s.end);
+        
+        const segmentText = text.substring(start, end);
+
+        const style: React.CSSProperties = {};
+        if (assignment) {
+            const hexColor = speakerColors[assignment.speakerId] || '#FFFFFF';
+            style.backgroundColor = hexToRgba(hexColor, 0.3);
+        }
+        if (atmosphere) {
+            style.textDecoration = 'underline wavy rgba(59, 130, 246, 0.7)'; // blue-500
+            style.textDecorationSkipInk = 'none';
+        }
+
+        segments.push(
+            <span key={`${start}-${end}`} style={style} title={atmosphere?.description}>
+                {segmentText}
+            </span>
+        );
+    }
+    
+    segments.push(<br key="final-break" />);
+
+    return segments;
   };
   
   const handleSelectionChange = (e: React.SyntheticEvent<HTMLTextAreaElement>) => {

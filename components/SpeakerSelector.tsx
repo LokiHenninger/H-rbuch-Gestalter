@@ -1,7 +1,8 @@
-import React from 'react';
+import React, { useState } from 'react';
 import type { Speaker, SpeakerSettings } from '../types';
-import { MOODS, SPEEDS, MALE_VOICES, FEMALE_VOICES } from '../constants';
+import { MOODS, SPEEDS } from '../constants';
 import { hexToRgba } from '../utils';
+import { VoiceSelectionModal } from './VoiceSelectionModal';
 
 interface SpeakerSelectorProps {
   speakers: Speaker[];
@@ -19,6 +20,10 @@ interface SpeakerSelectorProps {
   testingSpeakerId: string | null;
   onSaveSettings: () => void;
   onLoadSettings: () => void;
+  onTestRawVoice: (voice: string) => void;
+  testingRawVoice: string | null;
+  maleVoices: string[];
+  femaleVoices: string[];
 }
 
 export const SpeakerSelector: React.FC<SpeakerSelectorProps> = ({ 
@@ -37,9 +42,29 @@ export const SpeakerSelector: React.FC<SpeakerSelectorProps> = ({
   testingSpeakerId,
   onSaveSettings,
   onLoadSettings,
+  onTestRawVoice,
+  testingRawVoice,
+  maleVoices,
+  femaleVoices,
 }) => {
   const selectStyles = "w-full bg-gray-600 text-gray-200 border border-gray-500 rounded-md px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-500 transition";
   const buttonBaseStyles = "w-full text-center py-1.5 rounded-md transition-colors duration-200 ease-in-out disabled:cursor-not-allowed font-semibold text-sm";
+  
+  const [isVoiceModalOpen, setIsVoiceModalOpen] = useState(false);
+  const [speakerForVoiceChange, setSpeakerForVoiceChange] = useState<Speaker | null>(null);
+
+  const handleOpenVoiceModal = (speaker: Speaker) => {
+    setSpeakerForVoiceChange(speaker);
+    setIsVoiceModalOpen(true);
+  };
+  
+  const handleSelectVoice = (newVoice: string) => {
+    if (speakerForVoiceChange) {
+      onSpeakerVoiceChange(speakerForVoiceChange.id, newVoice);
+    }
+    setIsVoiceModalOpen(false);
+    setSpeakerForVoiceChange(null);
+  };
 
 
   return (
@@ -124,24 +149,17 @@ export const SpeakerSelector: React.FC<SpeakerSelectorProps> = ({
                   className="font-medium text-sm bg-transparent focus:bg-gray-700 rounded px-1 -ml-1 py-0 outline-none w-full disabled:cursor-default"
                   aria-label="Sprechername"
                 />
-                <span className="text-xs text-gray-500 flex-shrink-0">({speaker.voice})</span>
               </div>
               
               <div className="grid grid-cols-3 gap-2 mb-2">
                  <div>
-                   <select 
-                    id={`voice-${speaker.id}`}
-                    value={speaker.voice}
-                    onChange={(e) => onSpeakerVoiceChange(speaker.id, e.target.value)}
-                    className={selectStyles}
-                   >
-                     <optgroup label="Männlich">
-                        {MALE_VOICES.map(voice => <option key={voice} value={voice}>{voice}</option>)}
-                     </optgroup>
-                     <optgroup label="Weiblich">
-                        {FEMALE_VOICES.map(voice => <option key={voice} value={voice}>{voice}</option>)}
-                     </optgroup>
-                   </select>
+                    <button 
+                        onClick={() => handleOpenVoiceModal(speaker)} 
+                        className={`${selectStyles} text-left truncate`}
+                        aria-label={`Stimme für ${speaker.displayName} ändern. Aktuell: ${speaker.voice}`}
+                    >
+                        {speaker.voice}
+                    </button>
                 </div>
                  <div>
                    <select 
@@ -168,10 +186,18 @@ export const SpeakerSelector: React.FC<SpeakerSelectorProps> = ({
               <div className="grid grid-cols-3 gap-2 mt-2">
                 <button
                   onClick={() => onTestSpeaker(speaker)}
-                  disabled={isTesting}
-                  className={`${buttonBaseStyles} col-span-1 bg-gray-600 hover:bg-gray-500 disabled:bg-gray-700 disabled:text-gray-500`}
+                  disabled={testingSpeakerId !== null}
+                  className={`${buttonBaseStyles} col-span-1 bg-gray-600 hover:bg-gray-500 disabled:bg-gray-700 disabled:text-gray-500 flex items-center justify-center`}
                 >
-                  {isTesting ? '...' : 'Test'}
+                  {isTesting ? (
+                    <>
+                      <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                      <span>Test...</span>
+                    </>
+                  ) : 'Test'}
                 </button>
                 <button
                   onClick={() => onAssignSpeaker(speaker.id)}
@@ -199,6 +225,17 @@ export const SpeakerSelector: React.FC<SpeakerSelectorProps> = ({
           Neuen Sprecher hinzufügen
         </button>
       </div>
+
+      <VoiceSelectionModal
+        isOpen={isVoiceModalOpen}
+        onClose={() => setIsVoiceModalOpen(false)}
+        onSelectVoice={handleSelectVoice}
+        onTestVoice={onTestRawVoice}
+        currentVoice={speakerForVoiceChange?.voice || ''}
+        testingVoice={testingRawVoice}
+        maleVoices={maleVoices}
+        femaleVoices={femaleVoices}
+      />
     </div>
   );
 };

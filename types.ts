@@ -1,4 +1,3 @@
-
 export interface Speaker {
   id: string;
   name: string; // Internal name, e.g., 'Erzähler', 'Stimme A'
@@ -16,6 +15,13 @@ export interface Assignment {
   speakerId: string;
   mood?: Mood;
   speed?: Speed;
+}
+
+export interface AtmosphereSuggestion {
+  id: number;
+  start: number;
+  end: number;
+  description: string;
 }
 
 export interface Selection {
@@ -43,4 +49,5 @@ export interface ProjectData extends SavedSettings {
   title: string;
   text: string;
   assignments: Assignment[];
+  atmosphereSuggestions?: AtmosphereSuggestion[];
 }

@@ -1,5 +1,5 @@
 
-import { GoogleGenAI, Modality } from '@google/genai';
+import { GoogleGenAI, Modality, Type } from '@google/genai';
 import type { Assignment, Speaker, Mood, Speed, SpeakerSetting } from '../types';
 
 // Deklarieren der globalen lamejs-Bibliothek, die über ein Skript-Tag importiert wird
@@ -19,11 +19,11 @@ function decode(base64: string): Uint8Array {
 /**
  * Encodes raw PCM audio samples into an MP3 Blob using lamejs.
  * @param pcm16Samples - The raw audio data as 16-bit signed integers.
+ * @param bitRate - The desired bitrate for the MP3 encoding (e.g., 128, 192, 320).
  * @returns A Blob containing the MP3 audio data.
  */
-function encodeToMp3(pcm16Samples: Int16Array): Blob {
+function encodeToMp3(pcm16Samples: Int16Array, bitRate: number): Blob {
   const sampleRate = 24000; // Gemini TTS sample rate
-  const bitRate = 128;
   const channels = 1; // mono
 
   const mp3encoder = new lamejs.Mp3Encoder(channels, sampleRate, bitRate);
@@ -61,7 +61,6 @@ function getPromptForPart(text: string, mood?: Mood, speed?: Speed): string {
         'ironisch': 'sarcastically',
         'freundlich': 'kindly',
         'formell': 'formally',
-        // FIX: Corrected typo from 'ängslich' to 'ängstlich' to match the Mood type.
         'ängstlich': 'anxiously',
     };
     const speedMap: Record<Speed, string> = {
@@ -125,7 +124,8 @@ async function runPromisesWithConcurrency<T>(
 export async function generateAudiobook(
   text: string,
   assignments: Assignment[],
-  speakers: Speaker[]
+  speakers: Speaker[],
+  audioQuality: number
 ): Promise<Blob> {
   if (!process.env.API_KEY) {
     throw new Error("API key is not set. Please configure your environment variables.");
@@ -236,21 +236,24 @@ export async function generateAudiobook(
   const pcm16Samples = new Int16Array(combinedAudioBytes.buffer);
 
   // Encode the PCM data to an MP3 Blob
-  const mp3Blob = encodeToMp3(pcm16Samples);
+  const mp3Blob = encodeToMp3(pcm16Samples, audioQuality);
 
   return mp3Blob;
 }
 
 
 /**
- * Generates a short audio clip for testing a speaker's voice.
+ * Generates a short audio clip for testing a speaker's voice,
+ * applying the currently selected mood and speed settings.
+ * Returns raw PCM data for fast playback.
  */
-export async function testSpeakerVoice(speaker: Speaker, settings: SpeakerSetting): Promise<Blob> {
+export async function testSpeakerVoice(speaker: Speaker, settings: SpeakerSetting): Promise<Uint8Array> {
     if (!process.env.API_KEY) {
         throw new Error("API key is not set.");
     }
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
+    // The prompt uses the selected mood and speed.
     const promptText = getPromptForPart("Test", settings.mood, settings.speed);
 
     const response = await ai.models.generateContent({
@@ -271,9 +274,132 @@ export async function testSpeakerVoice(speaker: Speaker, settings: SpeakerSettin
         throw new Error('Audio-Generierung für den Test fehlgeschlagen.');
     }
     
+    // Return raw audio bytes directly to avoid slow client-side MP3 encoding for tests.
     const audioBytes = decode(base64Audio);
-    const pcm16Samples = new Int16Array(audioBytes.buffer);
-    const mp3Blob = encodeToMp3(pcm16Samples);
+    return audioBytes;
+}
 
-    return mp3Blob;
+/**
+ * Generates a short audio clip for testing a specific voice with a neutral prompt.
+ * Returns raw PCM data for fast playback.
+ */
+export async function testVoice(voiceName: string): Promise<Uint8Array> {
+    if (!process.env.API_KEY) {
+        throw new Error("API key is not set.");
+    }
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+    const promptText = "Test";
+
+    const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash-preview-tts",
+        contents: [{ parts: [{ text: promptText }] }],
+        config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+                voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: voiceName },
+                },
+            },
+        },
+    });
+
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!base64Audio) {
+        throw new Error('Audio-Generierung für den Test fehlgeschlagen.');
+    }
+    
+    return decode(base64Audio);
+}
+
+/**
+ * Analyzes the book text using a powerful AI model to identify speakers, moods, and atmospheres.
+ */
+export async function analyzeBookWithAI(text: string, existingSpeakers: Speaker[]): Promise<any> {
+    if (!process.env.API_KEY) {
+        throw new Error("API key is not set.");
+    }
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+    const validMoods: Mood[] = ['normal', 'fröhlich', 'traurig', 'wütend', 'flüsternd', 'aufgeregt', 'geheimnisvoll', 'ironisch', 'freundlich', 'formell', 'ängstlich'];
+    
+    const speakerList = existingSpeakers.map(s => s.displayName).join(', ');
+
+    const prompt = `
+      Analysiere den folgenden Buchtext. Deine Aufgabe ist es, den Text in Segmente zu unterteilen, basierend darauf, wer spricht oder ob es sich um eine Erzählung handelt.
+      
+      Du bekommst eine Liste von bereits existierenden Sprechern: [${speakerList}].
+      Verwende diese Sprecher konsistent wieder, wenn sie im Text auftauchen. Erstelle nur dann einen neuen Sprecher, wenn ein Charakter spricht, der noch nicht in der Liste ist. Der Standard-Sprecher ist "Erzähler".
+
+      Regeln:
+      1. Wörtliche Rede wird den entsprechenden Charakteren zugeordnet. Verwende die Namen aus der existierenden Sprecherliste.
+      2. Die "mood" MUSS einer der folgenden Werte sein: ${validMoods.join(', ')}. Wähle immer den passendsten.
+      3. "atmosphere" ist optional. Gib sie nur an, wenn der Text explizit eine hörbare Atmosphäre beschreibt.
+      4. Die Textsegmente müssen lückenlos den gesamten Originaltext abdecken und exakt mit dem Originaltext übereinstimmen.
+      5. Gib deine Antwort ausschließlich als JSON-Objekt zurück, das dem vorgegebenen Schema entspricht.
+
+      Text zum Analysieren:
+      ---
+      ${text}
+      ---
+    `;
+
+    const response = await ai.models.generateContent({
+        model: "gemini-2.5-pro",
+        contents: prompt,
+        config: {
+            maxOutputTokens: 8192, // Genug Platz für lange Antworten sicherstellen
+            responseMimeType: "application/json",
+            responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                    segments: {
+                        type: Type.ARRAY,
+                        description: "Eine Liste aller Textsegmente, die den gesamten Text lückenlos abdecken.",
+                        items: {
+                            type: Type.OBJECT,
+                            properties: {
+                                text: {
+                                    type: Type.STRING,
+                                    description: "Der exakte Text des Segments."
+                                },
+                                speakerName: {
+                                    type: Type.STRING,
+                                    description: "Name des Sprechers (z.B. 'Erzähler', 'Loki', 'Anna'). Muss ein Name aus der existierenden Liste sein, oder ein neuer, falls notwendig."
+                                },
+                                mood: {
+                                    type: Type.STRING,
+                                    description: `Die Stimmung des Sprechers. Muss einer der folgenden Werte sein: ${validMoods.join(', ')}.`,
+                                    enum: validMoods
+                                },
+                                atmosphere: {
+                                    type: Type.STRING,
+                                    description: "Eine kurze Beschreibung der hörbaren Hintergrundatmosphäre (optional)."
+                                }
+                            },
+                            required: ["text", "speakerName", "mood"]
+                        }
+                    }
+                },
+                required: ["segments"]
+            },
+        },
+    });
+
+    // Trim potential markdown fences
+    let jsonStr = response.text.trim();
+    if (jsonStr.startsWith("```json")) {
+        jsonStr = jsonStr.substring(7);
+    }
+    if (jsonStr.endsWith("```")) {
+        jsonStr = jsonStr.substring(0, jsonStr.length - 3);
+    }
+
+    try {
+        const parsedJson = JSON.parse(jsonStr);
+        return parsedJson;
+    } catch (error) {
+        console.error("Failed to parse AI response:", error, "Raw response:", jsonStr);
+        throw new Error("Die KI-Analyse hat ein ungültiges Format zurückgegeben. Bitte versuchen Sie es erneut.");
+    }
 }

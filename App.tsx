@@ -1,25 +1,28 @@
-
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { GoogleGenAI } from '@google/genai';
 import { HighlightingTextarea } from './components/HighlightingTextarea';
 import { SpeakerSelector } from './components/SpeakerSelector';
 import { AudioPlayer } from './components/AudioPlayer';
 import { LoadingSpinner } from './components/LoadingSpinner';
-import { INITIAL_SPEAKERS, INITIAL_SPEAKER_COLORS, ALL_AVAILABLE_VOICES } from './constants';
-import type { Assignment, Selection, Speaker, SpeakerSetting, SpeakerSettings, SavedSettings, ProjectData } from './types';
-import { generateAudiobook, testSpeakerVoice } from './services/geminiService';
+import { AnalysisLoadingModal } from './components/AnalysisLoadingModal';
+import { INITIAL_SPEAKERS, INITIAL_SPEAKER_COLORS, ALL_AVAILABLE_VOICES, MALE_VOICES, FEMALE_VOICES } from './constants';
+import type { Assignment, Selection, Speaker, SpeakerSetting, SpeakerSettings, SavedSettings, ProjectData, AtmosphereSuggestion, Mood } from './types';
+import { generateAudiobook, testSpeakerVoice, testVoice, analyzeBookWithAI } from './services/geminiService';
 
 // Deklarieren der globalen Bibliotheken, die über Skript-Tags importiert werden
 declare const pdfjsLib: any;
 
 const CHAR_LIMIT = 300000;
-const PROJECT_FILE_VERSION = 1;
+const RECOMMENDED_CHAR_LIMIT = 100000;
+const PROJECT_FILE_VERSION = 2; // Version bump for atmosphere suggestions
 
 const App: React.FC = () => {
   const [text, setText] = useState<string>('Fügen Sie hier Ihren Buchtext ein oder laden Sie eine Datei (.txt, .pdf). Markieren Sie dann einen Abschnitt und wählen Sie rechts einen Sprecher aus, um ihn zuzuweisen.');
   const [assignments, setAssignments] = useState<Assignment[]>([]);
+  const [atmosphereSuggestions, setAtmosphereSuggestions] = useState<AtmosphereSuggestion[]>([]);
   const [selection, setSelection] = useState<Selection | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
   const [isFileLoading, setIsFileLoading] = useState<boolean>(false);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -28,21 +31,29 @@ const App: React.FC = () => {
   const [speakers, setSpeakers] = useState<Speaker[]>(INITIAL_SPEAKERS);
   const [speakerColors, setSpeakerColors] = useState<{ [key: string]: string }>(INITIAL_SPEAKER_COLORS);
   const [testingSpeakerId, setTestingSpeakerId] = useState<string | null>(null);
-  const testAudioRef = useRef<HTMLAudioElement>(null);
+  const [testingRawVoice, setTestingRawVoice] = useState<string | null>(null);
+  const [audioQuality, setAudioQuality] = useState<number>(320);
+  
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const testAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const settingsFileInputRef = useRef<HTMLInputElement>(null);
   const projectFileInputRef = useRef<HTMLInputElement>(null);
   const importFileInputRef = useRef<HTMLInputElement>(null);
-
+  const testAudioCache = useRef<Map<string, AudioBuffer>>(new Map());
 
   const initialSettings = speakers.reduce((acc, speaker) => {
-    acc[speaker.id] = { mood: 'normal', speed: 'normal' };
+    if (speaker.id === 'spk_1') { // Erzähler ID
+      acc[speaker.id] = { mood: 'normal', speed: 'schnell' };
+    } else {
+      acc[speaker.id] = { mood: 'normal', speed: 'normal' };
+    }
     return acc;
   }, {} as SpeakerSettings);
 
   const [speakerSettings, setSpeakerSettings] = useState<SpeakerSettings>(initialSettings);
-
+  
   useEffect(() => {
-    // Configure PDF.js worker once on component mount for better performance and stability.
+    // Configure PDF.js worker once on component mount
     if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
         pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.10.377/pdf.worker.min.js`;
     }
@@ -118,7 +129,6 @@ const App: React.FC = () => {
     setSpeakerColors(prev => ({ ...prev, [speakerId]: newColor }));
   };
 
-
   const handleAssignSpeaker = useCallback((speakerId: string) => {
     if (!selection || selection.start === selection.end) return;
     
@@ -169,23 +179,78 @@ const App: React.FC = () => {
   }, [selection, speakers, handleAssignSpeaker]);
 
 
+  // Helper function to decode raw PCM data into an AudioBuffer for playback.
+  const pcmToAudioBuffer = (data: Uint8Array, ctx: AudioContext): AudioBuffer => {
+      const sampleRate = 24000; // Gemini TTS sample rate is 24kHz
+      const numChannels = 1; // mono
+      // The raw data is 16-bit PCM, so we create an Int16Array view on the buffer
+      const pcm16 = new Int16Array(data.buffer);
+      const frameCount = pcm16.length / numChannels;
+      const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+      const channelData = buffer.getChannelData(0);
+      for (let i = 0; i < frameCount; i++) {
+          // Convert 16-bit integer to a float between -1.0 and 1.0
+          channelData[i] = pcm16[i] / 32768.0;
+      }
+      return buffer;
+  };
+
   const handleTestSpeaker = async (speaker: Speaker) => {
+    // Stop any currently playing test audio source
+    if (testAudioSourceRef.current) {
+        try {
+            testAudioSourceRef.current.stop();
+        } catch (e) {
+            // It might have already stopped, which can throw an error. Ignore it.
+        }
+        testAudioSourceRef.current.disconnect();
+        testAudioSourceRef.current = null;
+    }
+
+    // Initialize AudioContext on the first user interaction
+    if (!audioContextRef.current) {
+        try {
+            audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        } catch (e) {
+            setError('Ihr Browser unterstützt die Web Audio API nicht, die für die Audiowiedergabe benötigt wird.');
+            return;
+        }
+    }
+    const audioContext = audioContextRef.current;
+    
+    if (audioContext.state === 'suspended') {
+        audioContext.resume();
+    }
+
     setTestingSpeakerId(speaker.id);
     setError(null);
     try {
         const settings = speakerSettings[speaker.id];
         if (!speaker || !settings) return;
 
-        const audioBlob = await testSpeakerVoice(speaker, settings);
-        const url = URL.createObjectURL(audioBlob);
-
-        if (testAudioRef.current) {
-            testAudioRef.current.src = url;
-            testAudioRef.current.play();
-            testAudioRef.current.onended = () => {
-                URL.revokeObjectURL(url);
-            };
+        // Fetch raw PCM audio data, skipping slow client-side MP3 encoding
+        const pcmBytes = await testSpeakerVoice(speaker, settings);
+        
+        if (pcmBytes.length === 0) {
+           throw new Error('Die API hat keine Audiodaten zurückgegeben.');
         }
+
+        // Decode the raw data into an AudioBuffer that can be played
+        const audioBuffer = pcmToAudioBuffer(pcmBytes, audioContext);
+
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        source.start();
+
+        source.onended = () => {
+            if (testAudioSourceRef.current === source) {
+                testAudioSourceRef.current = null;
+            }
+        };
+        
+        testAudioSourceRef.current = source;
+
     } catch (err) {
         console.error("Test audio failed:", err);
         setError(err instanceof Error ? err.message : 'Fehler beim Testen der Stimme.');
@@ -193,6 +258,76 @@ const App: React.FC = () => {
         setTestingSpeakerId(null);
     }
   };
+  
+    const handleTestRawVoice = async (voiceName: string) => {
+        if (testAudioSourceRef.current) {
+            try {
+                testAudioSourceRef.current.stop();
+            } catch (e) { /* ignore */ }
+            testAudioSourceRef.current.disconnect();
+            testAudioSourceRef.current = null;
+        }
+
+        if (!audioContextRef.current) {
+            try {
+                audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+            } catch (e) {
+                setError('Ihr Browser unterstützt die Web Audio API nicht, die für die Audiowiedergabe benötigt wird.');
+                return;
+            }
+        }
+        const audioContext = audioContextRef.current;
+        if (audioContext.state === 'suspended') {
+            audioContext.resume();
+        }
+
+        // Check cache first
+        if (testAudioCache.current.has(voiceName)) {
+            const audioBuffer = testAudioCache.current.get(voiceName)!;
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+            source.start();
+
+            source.onended = () => {
+                if (testAudioSourceRef.current === source) {
+                    testAudioSourceRef.current = null;
+                }
+            };
+            testAudioSourceRef.current = source;
+            return; // Exit early since we played from cache
+        }
+
+
+        setTestingRawVoice(voiceName);
+        setError(null);
+        try {
+            const pcmBytes = await testVoice(voiceName);
+            if (pcmBytes.length === 0) {
+               throw new Error('Die API hat keine Audiodaten zurückgegeben.');
+            }
+
+            const audioBuffer = pcmToAudioBuffer(pcmBytes, audioContext);
+            testAudioCache.current.set(voiceName, audioBuffer); // Save to cache
+
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+            source.start();
+
+            source.onended = () => {
+                if (testAudioSourceRef.current === source) {
+                    testAudioSourceRef.current = null;
+                }
+            };
+            testAudioSourceRef.current = source;
+        } catch (err) {
+            console.error("Test raw voice failed:", err);
+            setError(err instanceof Error ? err.message : 'Audio-Generierung für den Test fehlgeschlagen.');
+        } finally {
+            setTestingRawVoice(null);
+        }
+    };
 
 
   const handleGenerate = async () => {
@@ -204,7 +339,7 @@ const App: React.FC = () => {
     setIsLoading(true);
     setAudioUrl(null);
     try {
-      const audioBlob = await generateAudiobook(text, assignments, speakers);
+      const audioBlob = await generateAudiobook(text, assignments, speakers, audioQuality);
       const url = URL.createObjectURL(audioBlob);
       setAudioUrl(url);
     } catch (err) {
@@ -214,6 +349,152 @@ const App: React.FC = () => {
       setIsLoading(false);
     }
   };
+
+  const handleAnalyzeBook = async () => {
+      if (!text.trim() || text.length < 50) {
+          setError('Bitte fügen Sie einen längeren Text in den Editor ein, um die KI-Analyse zu verwenden.');
+          return;
+      }
+      setError(null);
+      setIsAnalyzing(true);
+      try {
+          // Pass the existing speakers to the AI for context and consistency.
+          const result = await analyzeBookWithAI(text, speakers);
+          if (!result || !result.segments) {
+              throw new Error("Die KI hat keine gültigen Segmente zurückgegeben.");
+          }
+
+          let currentSpeakers = [...speakers];
+          let currentSpeakerColors = { ...speakerColors };
+          let currentSpeakerSettings = { ...speakerSettings };
+          let currentAssignments: Assignment[] = [];
+          let currentAtmosphereSuggestions: AtmosphereSuggestion[] = [];
+          
+          const speakerNameIdMap: Map<string, string> = new Map();
+          // Pre-populate map with existing speakers
+          currentSpeakers.forEach(s => speakerNameIdMap.set(s.displayName, s.id));
+
+          let currentIndex = 0;
+          
+          const normalizeText = (t: string) => t.replace(/[\s"“„”'’`´]/g, '');
+
+          for (const segment of result.segments) {
+              let segmentText = segment.text;
+              let startIndex = text.indexOf(segmentText, currentIndex);
+              
+              if (startIndex === -1) {
+                  // Fallback to fuzzy search
+                  const normalizedSegment = normalizeText(segmentText);
+                  const searchArea = text.substring(currentIndex, currentIndex + segmentText.length + 50);
+                  const normalizedSearchArea = normalizeText(searchArea);
+                  
+                  const fuzzyIndex = normalizedSearchArea.indexOf(normalizedSegment);
+                  
+                  if (fuzzyIndex !== -1) {
+                      // Attempt to reconstruct the original segment from the main text
+                      let originalSegmentLength = 0;
+                      let normalizedCount = 0;
+                      for (let i = 0; i < searchArea.length; i++) {
+                          const char = searchArea[i];
+                          if (!/[\s"“„”'’`´]/.test(char)) {
+                              normalizedCount++;
+                          }
+                          if (normalizedCount > (fuzzyIndex + normalizedSegment.length -1)) {
+                             break;
+                          }
+                          if(normalizedCount > fuzzyIndex) {
+                            originalSegmentLength++;
+                          }
+                      }
+                      
+                      let startOffset = 0;
+                      let normCount = 0;
+                       for (let i = 0; i < searchArea.length; i++) {
+                          const char = searchArea[i];
+                           if (!/[\s"“„”'’`´]/.test(char)) {
+                              normCount++;
+                          }
+                           if (normCount > fuzzyIndex) {
+                             break;
+                          }
+                          startOffset++;
+                       }
+
+                      startIndex = currentIndex + startOffset;
+                      segmentText = text.substring(startIndex, startIndex + originalSegmentLength);
+
+                  } else {
+                     console.warn(`Konnte das Segment "${segmentText.substring(0, 30)}..." nicht im Originaltext finden. Überspringe.`);
+                     continue;
+                  }
+              }
+
+              const endIndex = startIndex + segmentText.length;
+              currentIndex = endIndex;
+              
+              let speakerId = speakerNameIdMap.get(segment.speakerName);
+
+              // Create a new speaker if it doesn't exist
+              if (!speakerId) {
+                  const newId = `spk_${Date.now()}_${Math.random()}`;
+                  const newVoice = ALL_AVAILABLE_VOICES[currentSpeakers.length % ALL_AVAILABLE_VOICES.length];
+                  const newSpeaker: Speaker = {
+                      id: newId,
+                      name: segment.speakerName,
+                      displayName: segment.speakerName,
+                      voice: newVoice,
+                  };
+                  currentSpeakers.push(newSpeaker);
+                  
+                  const randomColor = '#' + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0');
+                  currentSpeakerColors[newId] = randomColor;
+                  currentSpeakerSettings[newId] = { mood: 'normal', speed: 'normal' };
+                  
+                  speakerId = newId;
+                  speakerNameIdMap.set(segment.speakerName, speakerId);
+              }
+              
+              // Create assignment
+              currentAssignments.push({
+                  id: Date.now() + Math.random(),
+                  start: startIndex,
+                  end: endIndex,
+                  speakerId: speakerId,
+                  mood: segment.mood as Mood,
+                  speed: 'normal',
+              });
+
+              // Update speaker mood setting for this new assignment
+              currentSpeakerSettings[speakerId] = {
+                  ...currentSpeakerSettings[speakerId],
+                  mood: segment.mood as Mood,
+              };
+
+              // Create atmosphere suggestion
+              if (segment.atmosphere) {
+                  currentAtmosphereSuggestions.push({
+                      id: Date.now() + Math.random(),
+                      start: startIndex,
+                      end: endIndex,
+                      description: segment.atmosphere,
+                  });
+              }
+          }
+
+          // Update state all at once
+          setSpeakers(currentSpeakers);
+          setSpeakerColors(currentSpeakerColors);
+          setSpeakerSettings(currentSpeakerSettings);
+          setAssignments(currentAssignments);
+          setAtmosphereSuggestions(currentAtmosphereSuggestions);
+
+      } catch (err) {
+          console.error("AI analysis failed:", err);
+          setError(err instanceof Error ? err.message : 'Ein unbekannter Fehler ist bei der KI-Analyse aufgetreten.');
+      } finally {
+          setIsAnalyzing(false);
+      }
+  };
   
   const handleTextChange = (newText: string) => {
     setText(newText);
@@ -222,6 +503,7 @@ const App: React.FC = () => {
   const handleClearText = () => {
     setText('');
     setAssignments([]);
+    setAtmosphereSuggestions([]);
   };
   
   const handleSaveSettings = () => {
@@ -264,6 +546,7 @@ const App: React.FC = () => {
           setSpeakerColors(settings.speakerColors);
           setSpeakerSettings(settings.speakerSettings);
           setAssignments([]);
+          setAtmosphereSuggestions([]);
           setAudioUrl(null);
           setError(null);
         } else {
@@ -288,6 +571,7 @@ const App: React.FC = () => {
             title,
             text,
             assignments,
+            atmosphereSuggestions,
             speakers,
             speakerColors,
             speakerSettings
@@ -330,6 +614,7 @@ const App: React.FC = () => {
                   setSpeakers(data.speakers);
                   setSpeakerColors(data.speakerColors);
                   setSpeakerSettings(data.speakerSettings);
+                  setAtmosphereSuggestions(data.atmosphereSuggestions || []); // Load suggestions, default to empty array
                   setAudioUrl(null);
                   setError(null);
               } else {
@@ -382,6 +667,7 @@ const App: React.FC = () => {
 
           setText(extractedText);
           setAssignments([]);
+          setAtmosphereSuggestions([]);
       } catch (err) {
           console.error("Fehler beim Dateiimport:", err);
           let errorMessage = 'Datei konnte nicht importiert und verarbeitet werden.';
@@ -404,24 +690,25 @@ const App: React.FC = () => {
 
   const charCount = text.length;
   const wordCount = text.trim() === '' ? 0 : text.trim().split(/\s+/).length;
-  const isOverLimit = charCount > CHAR_LIMIT;
-  const isApproachingLimit = !isOverLimit && charCount > CHAR_LIMIT * 0.9;
-  const counterColor = isOverLimit
+  const isOverHardLimit = charCount > CHAR_LIMIT;
+  const isOverRecommendedLimit = !isOverHardLimit && charCount > RECOMMENDED_CHAR_LIMIT;
+
+  const counterColor = isOverHardLimit
     ? 'text-red-500'
-    : isApproachingLimit
+    : isOverRecommendedLimit
     ? 'text-yellow-400'
     : 'text-gray-500';
 
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 font-sans flex flex-col p-4 md:p-6 lg:p-8 relative">
+       <AnalysisLoadingModal isOpen={isAnalyzing} />
        {isFileLoading && (
         <div className="absolute inset-0 bg-gray-900 bg-opacity-75 flex flex-col items-center justify-center z-50 fade-in">
             <LoadingSpinner />
             <p className="mt-4 text-lg text-white">Datei wird verarbeitet...</p>
         </div>
        )}
-       <audio ref={testAudioRef} hidden />
         <input
           type="file"
           ref={settingsFileInputRef}
@@ -448,7 +735,7 @@ const App: React.FC = () => {
            <div className="flex-1">
              {/* Left spacer */}
            </div>
-           <h1 className="text-4xl md:text-5xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-purple-400 to-indigo-600 flex-shrink-0 mx-4">
+           <h1 className="text-4xl md:text-5xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-green-400 to-teal-500 flex-shrink-0 mx-4">
             Hörbuch-Gestalter
            </h1>
            <div className="flex-1 flex justify-end items-center gap-4">
@@ -474,6 +761,17 @@ const App: React.FC = () => {
           <div className="flex justify-between items-center mb-3 border-b border-gray-700 pb-2">
             <h2 className="text-xl font-semibold text-gray-300">Text-Editor</h2>
              <div className="flex items-center gap-4">
+              <button
+                 onClick={handleAnalyzeBook}
+                 disabled={isAnalyzing || isOverHardLimit}
+                 className="text-sm bg-indigo-600/50 hover:bg-indigo-600/80 disabled:bg-gray-600 disabled:text-gray-400 disabled:cursor-not-allowed text-white font-semibold py-1 px-3 rounded-md transition-colors flex items-center gap-2"
+                 title="Das Buch mit KI analysieren, um Sprecher und Stimmungen automatisch zuzuweisen."
+               >
+                 <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                   <path fillRule="evenodd" d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z" clipRule="evenodd" />
+                 </svg>
+                 Buch analysieren
+              </button>
               <button 
                 onClick={handleTriggerImport}
                 className="text-sm text-indigo-400 hover:text-indigo-300 transition-colors"
@@ -496,13 +794,21 @@ const App: React.FC = () => {
              <HighlightingTextarea
                 text={text}
                 assignments={assignments}
+                atmosphereSuggestions={atmosphereSuggestions}
                 onTextChange={handleTextChange}
                 onSelect={setSelection}
                 speakerColors={speakerColors}
                 id="main-textarea"
               />
-              <div className={`absolute bottom-2 right-4 text-xs font-mono select-none transition-colors ${counterColor}`}>
-                {wordCount.toLocaleString()} Wörter / {charCount.toLocaleString()}/{CHAR_LIMIT.toLocaleString()}
+               <div className="absolute bottom-2 right-4 text-xs font-mono select-none flex flex-col items-end">
+                {isOverRecommendedLimit && (
+                    <span className="text-yellow-400 mb-1">
+                        Empfehlung: Für beste Ergebnisse kapitelweise analysieren.
+                    </span>
+                )}
+                <span className={`transition-colors ${counterColor}`}>
+                    {wordCount.toLocaleString()} Wörter / {charCount.toLocaleString()}/{CHAR_LIMIT.toLocaleString()}
+                </span>
             </div>
           </div>
         </div>
@@ -524,6 +830,10 @@ const App: React.FC = () => {
             testingSpeakerId={testingSpeakerId}
             onSaveSettings={handleSaveSettings}
             onLoadSettings={handleTriggerLoadSettings}
+            onTestRawVoice={handleTestRawVoice}
+            testingRawVoice={testingRawVoice}
+            maleVoices={MALE_VOICES}
+            femaleVoices={FEMALE_VOICES}
           />
 
           <div className="mt-auto pt-4">
@@ -540,9 +850,24 @@ const App: React.FC = () => {
                 className="w-full bg-gray-700 text-gray-100 rounded-md border border-gray-600 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition"
               />
             </div>
+            <div className="mb-4">
+              <label htmlFor="audio-quality" className="block text-sm font-medium text-gray-400 mb-1">
+                Audioqualität
+              </label>
+              <select
+                id="audio-quality"
+                value={audioQuality}
+                onChange={(e) => setAudioQuality(Number(e.target.value))}
+                className="w-full bg-gray-700 text-gray-100 rounded-md border border-gray-600 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition"
+              >
+                <option value={128}>Standard (128 kbps, kleine Datei)</option>
+                <option value={192}>Hoch (192 kbps, gute Qualität)</option>
+                <option value={320}>Höchste (320 kbps, beste Qualität)</option>
+              </select>
+            </div>
              <button
               onClick={handleGenerate}
-              disabled={isLoading || !text.trim() || isOverLimit}
+              disabled={isLoading || !text.trim() || isOverHardLimit}
               className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-900 disabled:text-gray-500 disabled:cursor-not-allowed text-white font-bold py-3 px-4 rounded-lg transition-all duration-300 flex items-center justify-center text-lg shadow-lg"
             >
               {isLoading ? (

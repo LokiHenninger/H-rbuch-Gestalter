@@ -1,20 +1,33 @@
-
 import type { Speaker, Mood, Speed } from './types';
 
+export const VOICE_DB_VERSION = 4; // Version für die Stimmen-Datenbank erhöht, um die neue Sortierung zu erzwingen
+
 export const INITIAL_SPEAKERS: Speaker[] = [
-  { id: 'spk_1', name: 'Erzähler', displayName: 'Erzähler', voice: 'kore' },
+  { id: 'spk_1', name: 'Erzähler', displayName: 'Erzähler', voice: 'Orus' },
 ];
 
-export const MALE_VOICES: string[] = [
-    'charon', 'fenrir', 'iapetus', 'orus', 'puck', 'umbriel', 'zephyr', 'achernar', 
-    'achird', 'alnilam', 'enceladus', 'gacrux', 'rasalgethi', 'sadaltager', 'zubenelgenubi'
-];
-
+// Weibliche Stimmen sind: achernar, aoede, callirrhoe, despina, kore, leda, zephyr.
 export const FEMALE_VOICES: string[] = [
-    'aoede', 'autonoe', 'callirrhoe', 'despina', 'erinome', 'kore', 'laomedeia', 
-    'leda', 'algenib', 'algieba', 'pulcherrima', 'sadachbia', 'schedar', 'sulafat', 
-    'vindemiatrix'
-];
+    'Achernar', 
+    'Aoede', 
+    'Callirrhoe',
+    'Despina', 
+    'Kore',
+    'Leda', 
+    'Zephyr', 
+].sort();
+
+// Männliche Stimmen sind: charon, fenrir, iapetue, orus, puck, schedar, umbriel.
+export const MALE_VOICES: string[] = [
+    'Charon', 
+    'Fenrir', 
+    'Iapetus', // Typo corrected from "iapetue"
+    'Orus', 
+    'Puck', 
+    'Schedar', 
+    'Umbriel',
+].sort();
+
 
 export const ALL_AVAILABLE_VOICES: string[] = [...MALE_VOICES, ...FEMALE_VOICES].sort();
 
